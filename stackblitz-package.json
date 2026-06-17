@@ -1,0 +1,12 @@
+{
+  "name": "ppt-online-pictures-demo",
+  "version": "1.0.0",
+  "description": "PowerPoint Online Pictures / WebView2 demo with proxy server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=14"
+  }
+}
