@@ -26,6 +26,30 @@ const path = require('path');
 const PORT = process.env.PORT || 3000;
 
 /* ─────────────────────────────────────
+   "LAST KNOWN GOOD" BASE URL TRACKING
+   Some pages (Google included) call history.replaceState to scrub query
+   params from the visible address bar shortly after load. Since the
+   browser's Referer header on later requests reflects that *scrubbed*
+   URL, not the original /proxy?url=... we served, our usual
+   Referer-based recovery can come up empty.
+   As a fallback, we remember the last successfully proxied target URL
+   per client (keyed by a lightweight cookie) and use it to resolve
+   later bare/malformed relative requests when Referer recovery fails.
+   In-memory only — resets on server restart, which is fine for a demo.
+───────────────────────────────────── */
+const lastGoodBase = new Map();   // sessionId -> last successfully fetched absolute URL
+
+function getSessionId(req) {
+  const cookie = req.headers['cookie'] || '';
+  const match = cookie.match(/(?:^|;\s*)pptsid=([a-z0-9]+)/i);
+  return match ? match[1] : null;
+}
+
+function makeSessionId() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+/* ─────────────────────────────────────
    FETCH  (follows redirects, no deps)
 ───────────────────────────────────── */
 function fetchRemote(targetUrl, redirectDepth = 0) {
@@ -133,39 +157,71 @@ function rewriteHtml(html, baseUrl) {
     .replace(/<meta[^>]*name=["']?referrer["']?[^>]*>/gi, '');
 
   // ── Inject a small script that intercepts JS-driven navigation ──
-  // Catches location.href = "..." and window.location = "..." assignments
+  // v3: v2 left history.pushState/replaceState unpatched to avoid
+  // breaking Google's internal state tracking — but that meant Google's
+  // OWN replaceState calls (which it uses to scrub query params from the
+  // visible address bar after load) overwrite location.href with a bare,
+  // queryless URL. Any later relative request resolves against THAT
+  // broken base instead of the real proxied target, producing 502s on
+  // a no-leading-slash request like "search?q=cat" resolving to
+  // "/search?q=cat" or worse, plain "proxy?q=cat".
+  //
+  // Fix: track the real target URL in a dedicated variable set once at
+  // render time (server-side, so it can't be touched by the page's own
+  // JS), and resolve all our intercepted navigation against THAT instead
+  // of the live, mutable location.href. history.pushState/replaceState
+  // remain fully unpatched so Google's internal logic still works.
   const interceptScript = `
 <script>
 (function(){
   var _proxyBase = '/proxy?url=';
-  function wrap(loc) {
-    var orig = Object.getOwnPropertyDescriptor(loc, 'href') ||
-               Object.getOwnPropertyDescriptor(Object.getPrototypeOf(loc), 'href');
-    if (!orig || !orig.set) return;
-    Object.defineProperty(loc, 'href', {
-      get: orig.get,
-      set: function(v) {
-        try {
-          var abs = new URL(v, location.href).href;
-          orig.set.call(this, _proxyBase + encodeURIComponent(abs));
-        } catch(e) { orig.set.call(this, v); }
-      }
-    });
+  var _realBase = ${JSON.stringify(baseUrl)};   // fixed at render time, immune to in-page replaceState
+
+  function toProxied(v) {
+    try { return _proxyBase + encodeURIComponent(new URL(v, _realBase).href); }
+    catch(e) { return v; }
   }
-  try { wrap(window.location); } catch(e){}
-  // Patch pushState / replaceState so SPAs stay proxied
-  ['pushState','replaceState'].forEach(function(fn){
-    var orig = history[fn];
-    history[fn] = function(state, title, url) {
-      if (url && !url.startsWith('/proxy?') && !url.startsWith('#')) {
-        try {
-          var abs = new URL(url, location.href).href;
-          url = _proxyBase + encodeURIComponent(abs);
-        } catch(e){}
-      }
-      return orig.call(this, state, title, url);
-    };
-  });
+
+  try {
+    var origAssign = window.location.assign.bind(window.location);
+    window.location.assign = function(url) { origAssign(toProxied(url)); };
+  } catch(e) {}
+  try {
+    var origReplace = window.location.replace.bind(window.location);
+    window.location.replace = function(url) { origReplace(toProxied(url)); };
+  } catch(e) {}
+
+  document.addEventListener('click', function(e) {
+    var a = e.target.closest && e.target.closest('a[href]');
+    if (!a) return;
+    var href = a.getAttribute('href') || '';
+    if (!href || href.startsWith('#') || href.startsWith('/proxy?')
+        || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
+    e.preventDefault();
+    window.location.href = toProxied(href);
+  }, true);
+
+  // Also catch form submits (Google's search box submits via JS-built
+  // requests, but some forms still use a plain submit event)
+  document.addEventListener('submit', function(e) {
+    var form = e.target;
+    if (!form || !form.action) return;
+    var action = form.getAttribute('action') || '';
+    if (action.startsWith('/proxy?')) return; // already proxied by server-side rewrite
+    e.preventDefault();
+    var fd = new FormData(form);
+    var params = new URLSearchParams();
+    for (var pair of fd.entries()) params.append(pair[0], pair[1]);
+    var target = action || _realBase;
+    var full = target + (target.includes('?') ? '&' : '?') + params.toString();
+    window.location.href = toProxied(full);
+  }, true);
+
+  // history.pushState/replaceState remain UNPATCHED — Google's internal
+  // tab/view-state logic depends on reading back exactly what it wrote.
+  // The address bar may show a scrubbed/SPA-internal URL during in-page
+  // navigation; our own request recovery no longer depends on it because
+  // it's anchored to _realBase above, not location.href.
 })();
 </script>`;
 
@@ -213,11 +269,21 @@ const server = http.createServer(async (req, res) => {
   try { reqUrl = new URL(req.url, `http://localhost:${PORT}`); }
   catch { res.writeHead(400); res.end('Bad request URL'); return; }
 
+  // ── Session cookie (used only for lastGoodBase recovery fallback) ──
+  let sessionId = getSessionId(req);
+  let needsSetCookie = false;
+  if (!sessionId) {
+    sessionId = makeSessionId();
+    needsSetCookie = true;
+  }
+
   // ── Serve the demo page ──
   if (reqUrl.pathname === '/' || reqUrl.pathname === '/index.html') {
     try {
       const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      const headers = { 'Content-Type': 'text/html; charset=utf-8' };
+      if (needsSetCookie) headers['Set-Cookie'] = `pptsid=${sessionId}; Path=/; SameSite=Lax`;
+      res.writeHead(200, headers);
       res.end(html);
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'text/plain' });
@@ -231,14 +297,31 @@ const server = http.createServer(async (req, res) => {
   //  like fetch("/search?q=cats") that our HTML rewriter never saw, since
   //  it only rewrites static href/src/action attributes — not JS calls)
   const isExplicitProxyCall = reqUrl.pathname === '/proxy';
+
+  // Shared helper for both recovery tiers below. The browser's request
+  // path is relative to OUR origin (e.g. "/proxy?q=cat" or "/search?q=x"),
+  // but "/proxy" itself is an artifact of our own routing, not part of
+  // the real target site's path structure. If we resolved it naively
+  // against a base like "https://www.google.com/", we'd get the wrong
+  // result "https://www.google.com/proxy?q=cat" instead of
+  // "https://www.google.com/?q=cat". Strip a literal leading "/proxy"
+  // segment (if present) before resolving so the math comes out right.
+  function resolveAgainstBase(rawReqUrl, base) {
+    const stripped = rawReqUrl.replace(/^\/proxy(?=[?\/]|$)/, '') || '/';
+    return new URL(stripped, base).href;
+  }
+
   if (isExplicitProxyCall || true) {
     let targetUrl = isExplicitProxyCall ? reqUrl.searchParams.get('url') : null;
 
-    // Recovery path: resolve the bare relative request the browser made
+    // Tier 1 recovery: resolve the bare relative request the browser made
     // against whatever page referred it here. The Referer header is sent
     // automatically by the browser and — since every page we serve was
     // itself loaded via /proxy?url=... — it lets us reconstruct the
-    // real absolute URL the page actually intended to fetch.
+    // real absolute URL the page actually intended to fetch. This works
+    // UNLESS the referring page already scrubbed its own URL via
+    // history.replaceState (Google does this after load), in which case
+    // Referer itself reflects a scrubbed, queryless /proxy URL.
     if (!targetUrl) {
       const referer = req.headers['referer'] || req.headers['referrer'];
       let refererTarget = null;
@@ -250,20 +333,33 @@ const server = http.createServer(async (req, res) => {
 
       if (refererTarget) {
         try {
-          targetUrl = new URL(req.url, refererTarget).href;
+          targetUrl = resolveAgainstBase(req.url, refererTarget);
           console.log(`  ↺ recovered via Referer: ${req.url} → ${targetUrl}`);
-        } catch { /* fall through to the 400 below */ }
+        } catch { /* fall through to tier 2 */ }
       }
     }
 
+    // Tier 2 recovery: Referer was missing or already scrubbed. Fall back
+    // to the last successfully proxied base URL remembered for this
+    // session (cookie), and resolve the bare relative request against it.
+    if (!targetUrl && sessionId && lastGoodBase.has(sessionId)) {
+      const fallbackBase = lastGoodBase.get(sessionId);
+      try {
+        targetUrl = resolveAgainstBase(req.url, fallbackBase);
+        console.log(`  ↺ recovered via lastGoodBase: ${req.url} → ${targetUrl}`);
+      } catch { /* fall through to the 400 below */ }
+    }
+
     // If this wasn't even an explicit /proxy call and we couldn't recover
-    // a target (no useful referer), it's a genuine 404 — don't swallow
-    // unrelated requests (favicon.ico, etc) into confusing proxy errors.
+    // a target (no useful referer, no session history), it's a genuine
+    // 404 — don't swallow unrelated requests (favicon.ico, etc) into
+    // confusing proxy errors.
     if (!targetUrl && !isExplicitProxyCall) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('Not found');
       return;
     }
+
 
     if (!targetUrl) {
       res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -316,9 +412,21 @@ const server = http.createServer(async (req, res) => {
         body = Buffer.from(html, 'utf8');
         outHeaders['Content-Type'] = 'text/html; charset=utf-8';
         outHeaders['Content-Length'] = String(body.length);
+
+        // Remember this as the last successfully proxied HTML page for
+        // this session — used as a Tier 2 recovery fallback when a later
+        // bare relative request can't be resolved via Referer (e.g. the
+        // page already scrubbed its own URL with history.replaceState).
+        if (sessionId && result.status >= 200 && result.status < 300) {
+          lastGoodBase.set(sessionId, targetUrl);
+        }
       } else {
         body = result.body;
         outHeaders['Content-Length'] = String(body.length);
+      }
+
+      if (needsSetCookie) {
+        outHeaders['Set-Cookie'] = `pptsid=${sessionId}; Path=/; SameSite=Lax`;
       }
 
       res.writeHead(result.status, outHeaders);
