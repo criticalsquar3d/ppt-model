@@ -247,9 +247,11 @@ body {
 ═══════════════════════════════════ */
 .op-dialog {
   position: fixed;
-  top: 74px; right: 16px;
-  width: 400px;
-  height: calc(100vh - 96px);
+  top: 38px; right: 20px;
+  width: min(900px, calc(100vw - 40px));
+  height: calc(100vh - 76px);
+  min-height: 480px;
+  max-height: none;
   background: white;
   border: 1px solid #c8c6c4;
   box-shadow: 0 8px 40px rgba(0,0,0,0.28), 0 2px 8px rgba(0,0,0,0.12);
@@ -346,7 +348,7 @@ body {
 /* Results grid */
 .results-grid {
   flex: 1; overflow-y: auto; padding: 8px;
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px;
   min-height: 0;
 }
 .results-grid::-webkit-scrollbar { width: 5px; }
@@ -610,7 +612,8 @@ body {
 .sim-gi2-chip:hover { background: #f1f3f4; border-color: #bdc1c6; }
 .sim-gi2-result-info { padding: 4px 12px; font-size: 11px; color: #70757a; }
 /* Masonry layout using CSS columns */
-.sim-gi2-masonry { column-count: 3; column-gap: 4px; padding: 4px 12px 12px; }
+.sim-gi2-masonry { column-count: 4; column-gap: 4px; padding: 4px 12px 12px; }
+@media (min-width: 700px) { .sim-gi2-masonry { column-count: 5; } }
 .sim-gi2-item {
   break-inside: avoid; margin-bottom: 4px;
   cursor: pointer; border-radius: 8px; overflow: hidden;
@@ -661,7 +664,7 @@ body {
 }
 .sim-bing2-tab:hover { color: #000; }
 .sim-bing2-tab.active { color: #004C87; border-bottom-color: #004C87; font-weight: 600; }
-.sim-bing2-grid { padding: 10px 14px; display: grid; grid-template-columns: repeat(3,1fr); gap: 4px; }
+.sim-bing2-grid { padding: 10px 14px; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 4px; }
 .sim-bing2-img {
   cursor: pointer; border-radius: 4px; overflow: hidden; position: relative;
   background: #f3f2f1;
@@ -1487,14 +1490,21 @@ function buildGoogleHome(url) {
     </div>
     <div class="sim-g2-searchbox">
       <span class="sim-g2-search-ico">🔍</span>
-      <div class="sim-g2-search-txt">Search Google or type a URL</div>
+      <input
+        id="simGoogleInput"
+        class="sim-g2-search-txt"
+        type="text"
+        placeholder="Search Google or type a URL"
+        style="border:none;outline:none;background:transparent;font-size:14px;font-family:arial,sans-serif;width:100%;color:#202124"
+        onkeydown="if(event.key==='Enter'){ var q=this.value.trim(); if(q) navigateTo('https://www.google.com/search?q='+encodeURIComponent(q)); }"
+      >
       <div class="sim-g2-search-right">
         <span title="Search by image">📷</span>
         <span title="Search by voice">🎤</span>
       </div>
     </div>
     <div class="sim-g2-btns">
-      <button class="sim-g2-btn">Google Search</button>
+      <button class="sim-g2-btn" onclick="var q=document.getElementById('simGoogleInput').value.trim(); if(q) navigateTo('https://www.google.com/search?q='+encodeURIComponent(q)); else navigateTo('https://www.google.com')">Google Search</button>
       <button class="sim-g2-btn" onclick="navigateTo('https://images.google.com')">Google Images →</button>
     </div>
     <div class="sim-g2-note">
