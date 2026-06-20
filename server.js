@@ -221,13 +221,57 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── Proxy endpoint ──
-  if (reqUrl.pathname === '/proxy') {
-    const targetUrl = reqUrl.searchParams.get('url');
+  // ── Proxy endpoint, OR any other path the browser requested directly ──
+  // (the latter happens when a page's own JS makes a relative-path request
+  //  like fetch("/search?q=cats") that our HTML rewriter never saw, since
+  //  it only rewrites static href/src/action attributes — not JS calls)
+  const isExplicitProxyCall = reqUrl.pathname === '/proxy';
+  if (isExplicitProxyCall || true) {
+    let targetUrl = isExplicitProxyCall ? reqUrl.searchParams.get('url') : null;
+
+    // Recovery path: resolve the bare relative request the browser made
+    // against whatever page referred it here. The Referer header is sent
+    // automatically by the browser and — since every page we serve was
+    // itself loaded via /proxy?url=... — it lets us reconstruct the
+    // real absolute URL the page actually intended to fetch.
+    if (!targetUrl) {
+      const referer = req.headers['referer'] || req.headers['referrer'];
+      let refererTarget = null;
+      if (referer) {
+        try {
+          refererTarget = new URL(referer).searchParams.get('url');
+        } catch { /* ignore malformed referer */ }
+      }
+
+      if (refererTarget) {
+        try {
+          targetUrl = new URL(req.url, refererTarget).href;
+          console.log(`  ↺ recovered via Referer: ${req.url} → ${targetUrl}`);
+        } catch { /* fall through to the 400 below */ }
+      }
+    }
+
+    // If this wasn't even an explicit /proxy call and we couldn't recover
+    // a target (no useful referer), it's a genuine 404 — don't swallow
+    // unrelated requests (favicon.ico, etc) into confusing proxy errors.
+    if (!targetUrl && !isExplicitProxyCall) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
+      return;
+    }
 
     if (!targetUrl) {
-      res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Missing ?url= parameter'); return;
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:24px;color:#721c24;background:#f8d7da">
+        <h3>Missing ?url= parameter</h3>
+        <p>This page tried to navigate using JavaScript (not a plain link), and no
+        <code>Referer</code> header was available to recover the intended destination.</p>
+        <p style="font-size:12px;color:#856404;background:#fff3cd;padding:8px;border-radius:4px">
+          This is a known limitation of regex-based link rewriting — some sites
+          build requests dynamically in JS in ways a proxy can't always intercept.
+        </p>
+      </body></html>`);
+      return;
     }
 
     // Basic safety — only allow http/https
