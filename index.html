@@ -1422,7 +1422,13 @@ function tryRealIframe(url, el) {
       <iframe id="wvIframe"
         src="${proxyUrl}"
         title="Embedded page via proxy"
-        referrerpolicy="no-referrer"></iframe>
+        referrerpolicy="unsafe-url"></iframe>
+      <!--
+        referrerpolicy="unsafe-url" is intentional: our /proxy recovery
+        logic depends on receiving a Referer header for JS-driven relative
+        requests the HTML rewriter couldn't catch. "no-referrer" would
+        silently break that recovery path.
+      -->
     </div>`;
 
   const iframe = document.getElementById('wvIframe');

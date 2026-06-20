@@ -126,10 +126,11 @@ function rewriteHtml(html, baseUrl) {
     }
   );
 
-  // ── Strip frame-blocking meta tags ──
+  // ── Strip frame-blocking and referrer-suppressing meta tags ──
   html = html
     .replace(/<meta[^>]*http-equiv=["']?x-frame-options["']?[^>]*>/gi, '')
-    .replace(/<meta[^>]*http-equiv=["']?content-security-policy["']?[^>]*>/gi, '');
+    .replace(/<meta[^>]*http-equiv=["']?content-security-policy["']?[^>]*>/gi, '')
+    .replace(/<meta[^>]*name=["']?referrer["']?[^>]*>/gi, '');
 
   // ── Inject a small script that intercepts JS-driven navigation ──
   // Catches location.href = "..." and window.location = "..." assignments
@@ -189,6 +190,10 @@ const STRIP_HEADERS = new Set([
   'content-security-policy-report-only',
   'x-content-type-options',
   'strict-transport-security',
+  'referrer-policy',      // the target site may set its own no-referrer
+                          // policy, which would suppress the Referer
+                          // header our /proxy recovery logic relies on
+  'permissions-policy',
   'transfer-encoding',   // we re-encode as a simple response
   'content-encoding',    // we decoded via identity
   'connection',
