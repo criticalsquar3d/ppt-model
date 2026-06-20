@@ -306,8 +306,35 @@ const server = http.createServer(async (req, res) => {
   // result "https://www.google.com/proxy?q=cat" instead of
   // "https://www.google.com/?q=cat". Strip a literal leading "/proxy"
   // segment (if present) before resolving so the math comes out right.
+  //
+  // Separately: a QUERY-ONLY relative reference (just "?q=cat...", no
+  // path at all) is genuinely ambiguous — it means "resubmit against
+  // whatever path I'm logically on right now", but our stored base is
+  // frozen at whatever URL we last fetched (e.g. the bare homepage "/"),
+  // which may not match the path the host page's own JS believes it's
+  // on after internal replaceState navigation. This is exactly what
+  // happens with Google's homepage search box: it submits a query-only
+  // request, we resolve it against the stored homepage base "/", and
+  // get "google.com/?q=cat" — which Google's backend doesn't actually
+  // serve results from (results live at "/search"), causing a fetch
+  // failure (502) further down. We special-case recognized search
+  // engines so a "q=" query-only request routes to their real search
+  // path instead of trusting the stored base's path blindly.
   function resolveAgainstBase(rawReqUrl, base) {
     const stripped = rawReqUrl.replace(/^\/proxy(?=[?\/]|$)/, '') || '/';
+
+    if (stripped.startsWith('?')) {
+      try {
+        const baseHost = new URL(base).hostname;
+        const params = new URLSearchParams(stripped.slice(1));
+        if (params.has('q')) {
+          if (baseHost.includes('google.')) return new URL('/search' + stripped, base).href;
+          if (baseHost.includes('bing.'))   return new URL('/search' + stripped, base).href;
+          if (baseHost.includes('duckduckgo.')) return new URL('/' + stripped, base).href;
+        }
+      } catch { /* fall through to default resolution below */ }
+    }
+
     return new URL(stripped, base).href;
   }
 
