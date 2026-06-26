@@ -108,53 +108,99 @@ function fetchRemote(targetUrl, redirectDepth = 0) {
    all stay inside the iframe.
 ───────────────────────────────────── */
 function rewriteHtml(html, baseUrl) {
-  // ── Rewrite element attributes: href, src, action, data-src, poster, srcset ──
-  html = html.replace(
-    /(\s(?:href|src|action|data-src|poster)=)(["'])([^"']*)(["'])/gi,
-    (match, attr, q1, val, q2) => {
-      const v = val.trim();
-      if (!v
-        || v.startsWith('#')
-        || v.startsWith('javascript:')
-        || v.startsWith('data:')
-        || v.startsWith('mailto:')
-        || v.startsWith('blob:')
-        || v.startsWith('/proxy?')
-      ) return match;
+  // ── Script-aware rewriting ──────────────────────────────────────────────
+  // The previous version ran every regex over the entire HTML as a flat
+  // string, which caused it to corrupt minified JS bundles: strings like
+  //   var x = ' src="https://...' inside a <script> block
+  // were being rewritten through /proxy?url=, producing SyntaxErrors.
+  //
+  // Fix: split the document into alternating [markup, script/style, markup,
+  // script/style …] segments. Only rewrite the markup segments; leave
+  // script and style content completely untouched. Then reassemble.
+  //
+  // We treat <script…>…</script> AND <style…>…</style> as opaque blocks.
+  // Note: this doesn't handle the (rare) edge case of a literal </script>
+  // string inside a script block — but minified real-world bundles don't
+  // contain that, and this is far better than the flat-regex status quo.
 
+  const BLOCK_RE = /(<(?:script|style)[^>]*>)([\s\S]*?)(<\/(?:script|style)>)/gi;
+
+  // Collect blocks and their positions so we can split/reassemble
+  const blocks = [];   // { start, end, open, content, close }
+  let m;
+  while ((m = BLOCK_RE.exec(html)) !== null) {
+    blocks.push({ start: m.index, end: m.index + m[0].length,
+                  open: m[1], content: m[2], close: m[3] });
+  }
+
+  // Build segments: alternating markup (to be rewritten) and blocks (kept raw)
+  const markupSegments = [];
+  let cursor = 0;
+  for (const b of blocks) {
+    markupSegments.push({ type: 'markup', text: html.slice(cursor, b.start) });
+    markupSegments.push({ type: 'block',  open: b.open, content: b.content, close: b.close });
+    cursor = b.end;
+  }
+  markupSegments.push({ type: 'markup', text: html.slice(cursor) });
+
+  // Rewrite only markup segments
+  const rewriteMarkup = (markup) => {
+    // ── href / src / action / data-src / poster attributes ──
+    markup = markup.replace(
+      /(\s(?:href|src|action|data-src|poster)=)(["'])([^"']*)(["'])/gi,
+      (match, attr, q1, val, q2) => {
+        const v = val.trim();
+        if (!v
+          || v.startsWith('#')
+          || v.startsWith('javascript:')
+          || v.startsWith('data:')
+          || v.startsWith('mailto:')
+          || v.startsWith('blob:')
+          || v.startsWith('/proxy?')
+        ) return match;
+        try {
+          const abs = new URL(v, baseUrl).href;
+          return `${attr}${q1}/proxy?url=${encodeURIComponent(abs)}${q2}`;
+        } catch { return match; }
+      }
+    );
+
+    // ── CSS url() inside inline style attributes only (not <style> blocks) ──
+    markup = markup.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, q, val) => {
+      const v = val.trim();
+      if (!v || v.startsWith('data:') || v.startsWith('/proxy?')) return match;
       try {
         const abs = new URL(v, baseUrl).href;
-        return `${attr}${q1}/proxy?url=${encodeURIComponent(abs)}${q2}`;
+        return `url('/proxy?url=${encodeURIComponent(abs)}')`;
       } catch { return match; }
-    }
-  );
+    });
 
-  // ── Rewrite CSS url() inside style attributes and <style> blocks ──
-  html = html.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, q, val) => {
-    const v = val.trim();
-    if (!v || v.startsWith('data:') || v.startsWith('/proxy?')) return match;
-    try {
-      const abs = new URL(v, baseUrl).href;
-      return `url('/proxy?url=${encodeURIComponent(abs)}')`;
-    } catch { return match; }
-  });
+    // ── <meta http-equiv="refresh"> ──
+    markup = markup.replace(
+      /(<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*url=)([^"';>]+)/gi,
+      (match, prefix, refreshUrl) => {
+        try {
+          const abs = new URL(refreshUrl.trim(), baseUrl).href;
+          return `${prefix}/proxy?url=${encodeURIComponent(abs)}`;
+        } catch { return match; }
+      }
+    );
 
-  // ── Rewrite <meta http-equiv="refresh" content="0;url=..."> ──
-  html = html.replace(
-    /(<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*url=)([^"';>]+)/gi,
-    (match, prefix, refreshUrl) => {
-      try {
-        const abs = new URL(refreshUrl.trim(), baseUrl).href;
-        return `${prefix}/proxy?url=${encodeURIComponent(abs)}`;
-      } catch { return match; }
-    }
-  );
+    // ── Strip frame-blocking and referrer-suppressing meta tags ──
+    markup = markup
+      .replace(/<meta[^>]*http-equiv=["']?x-frame-options["']?[^>]*>/gi, '')
+      .replace(/<meta[^>]*http-equiv=["']?content-security-policy["']?[^>]*>/gi, '')
+      .replace(/<meta[^>]*name=["']?referrer["']?[^>]*>/gi, '');
 
-  // ── Strip frame-blocking and referrer-suppressing meta tags ──
-  html = html
-    .replace(/<meta[^>]*http-equiv=["']?x-frame-options["']?[^>]*>/gi, '')
-    .replace(/<meta[^>]*http-equiv=["']?content-security-policy["']?[^>]*>/gi, '')
-    .replace(/<meta[^>]*name=["']?referrer["']?[^>]*>/gi, '');
+    return markup;
+  };
+
+  // Reassemble
+  html = markupSegments.map(seg =>
+    seg.type === 'markup'
+      ? rewriteMarkup(seg.text)
+      : seg.open + seg.content + seg.close   // script/style untouched
+  ).join('');
 
   // ── Inject a small script that intercepts JS-driven navigation ──
   // v3: v2 left history.pushState/replaceState unpatched to avoid
